@@ -1,151 +1,212 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cuda.h>
 
-// Define the trie node structure
-typedef struct node {
-    int bitmap[8];  // Bitmap for 256 possible children
-    int offset;     // Offset in the flat trie array to the first child
-    int is_final;   // Indicates if this node is the end of a pattern
-    struct node* children[256];  // Pointers to child nodes
-} node_t;
+#define ALPHABET_SIZE 256
+#define MAX_DEPTH 8
 
-// Global variables
-node_t flat_trie[10000];
-int node_count = 0;
+typedef struct TrieNode {
+    struct TrieNode* children[ALPHABET_SIZE];
+    int is_end_of_word;
+    unsigned int bitmap[8];  // Assuming 32-bit integers and 256 ASCII characters
+} TrieNode;
 
-node_t* create_node() {
-    node_t* new_node = (node_t*)malloc(sizeof(node_t));
-    memset(new_node, 0, sizeof(node_t));
-    return new_node;
+typedef struct {
+    int children[ALPHABET_SIZE];  // Indices to children in the flat array
+    int is_end_of_word;
+    unsigned int bitmap[8];  // Assuming 32-bit integers and 256 ASCII characters
+} FlatTrieNode;
+
+
+TrieNode* create_node() {
+    TrieNode* node = (TrieNode*) malloc(sizeof(TrieNode));
+    memset(node, 0, sizeof(TrieNode));
+    return node;
 }
 
-void insert_pattern(node_t* root, const char* pattern) {
-    node_t* current = root;
-    while (*pattern) {
-        unsigned char index = *pattern;
-        if (!current->children[index]) {
-            current->children[index] = create_node();
+void insert(TrieNode* root, const char* pattern) {
+    TrieNode* node = root;
+    int depth = 0;
+    while (*pattern && depth < MAX_DEPTH) {
+        unsigned char index = (unsigned char) *pattern;
+        if (!node->children[index]) {
+            node->children[index] = create_node();
         }
-        current->bitmap[index / 32] |= (1 << (index % 32));
-        current = current->children[index];
+        node->bitmap[index / 32] |= (1 << (index % 32));
+        node = node->children[index];
         pattern++;
+        depth++;
     }
-    current->is_final = 1;
+    node->is_end_of_word = 1;
 }
 
-// Function to flatten the trie into an array
-int flatten_trie(node_t* root) {
-    if (!root) return -1;
-
-    int index = node_count++;
-    flat_trie[index] = *root;
-
+// Generate a unique signature for each subtree
+unsigned long generate_signature(TrieNode* node) {
+    if (!node) return 0;
+    
+    unsigned long signature = 5381;  // Starting number
+    signature = ((signature << 5) + signature) + node->character;
     for (int i = 0; i < 256; i++) {
-        if (root->children[i]) {
-            root->offset = flatten_trie(root->children[i]);
+        if (node->children[i]) {
+            signature = ((signature << 5) + signature) + generate_signature(node->children[i]);
         }
     }
-    return index;
+    return signature;
 }
 
-// CUDA kernel for the optimized search
-__global__ void optimized_gpu_search_kernel(node_t* flat_trie, char* text, int text_len, int segment_len, int* results) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int start = tid * segment_len;
-    int end = min(start + segment_len, text_len);
+void compress_suffixes(TrieNode* node, TrieNode* root) {
+    if (!node) return;
 
-    __shared__ char shared_text[1024];  // Assuming blockDim.x = 256 and segment_len = 4
-    int local_tid = threadIdx.x;
-    for (int i = 0; i < segment_len; i += blockDim.x) {
-        if (local_tid + i < segment_len && start + i + local_tid < text_len) {
-            shared_text[local_tid + i] = text[start + i + local_tid];
+    unsigned long current_signature = generate_signature(node);
+    
+    // Compare with every other node's subtree
+    for (int i = 0; i < 256; i++) {
+        if (node->children[i]) {
+            unsigned long child_signature = generate_signature(node->children[i]);
+            if (child_signature == current_signature) {
+                // Free the subtree of node->children[i] and point it to node
+                // Note: actual node deletion code is omitted for simplicity
+                node->children[i] = node;
+            }
         }
+    }
+    
+    // Recurse for all children
+    for (int i = 0; i < 256; i++) {
+        compress_suffixes(node->children[i], root);
+    }
+}
+
+
+// Merge nodes with only one child (prefix compression)
+void compress_trie(TrieNode* node) {
+    if (!node) {
+        return;
+    }
+
+    int children_count = 0;
+    unsigned char child_index = 0;
+    for (unsigned char i = 0; i < ALPHABET_SIZE; i++) {
+        if (node->children[i]) {
+            children_count++;
+            child_index = i;
+        }
+    }
+
+    // If only one child, merge with current node
+    if (children_count == 1) {
+        TrieNode* child = node->children[child_index];
+        memcpy(node->bitmap, child->bitmap, sizeof(node->bitmap));
+        for (unsigned char i = 0; i < ALPHABET_SIZE; i++) {
+            node->children[i] = child->children[i];
+        }
+        free(child);
+    }
+
+    // Recursively compress child nodes
+    for (unsigned char i = 0; i < ALPHABET_SIZE; i++) {
+        compress_trie(node->children[i]);
+    }
+}
+
+
+// Recursive function to free trie memory
+void free_trie(TrieNode* node) {
+    if (!node) {
+        return;
+    }
+    for (unsigned char i = 0; i < ALPHABET_SIZE; i++) {
+        free_trie(node->children[i]);
+    }
+    free(node);
+}
+
+void cpu_search(TrieNode* root, const char* text) {
+    const char* ptr = text;
+    while (*ptr) {
+        TrieNode* node = root;
+        const char* temp = ptr;
+        while (*temp && node->children[(unsigned char)*temp]) {
+            unsigned char index = (unsigned char) *temp;
+            if (!(node->bitmap[index / 32] & (1 << (index % 32)))) {
+                break;  // Character not in trie
+            }
+            node = node->children[index];
+            temp++;
+            if (node->is_end_of_word) {
+                printf("Pattern found at position %ld\n", ptr - text);
+            }
+        }
+        ptr++;
+    }
+}
+
+__global__ void search_kernel(FlatTrieNode* d_trie, const char* d_text, int text_len, int* d_results) {
+    extern __shared__ char shared_text[];
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int local_tid = threadIdx.x;
+
+    // Load text into shared memory
+    if (tid < text_len) {
+        shared_text[local_tid] = d_text[tid];
     }
     __syncthreads();
 
-    for (int i = 0; i < segment_len && start + i < text_len; i++) {
-        int current_index = 0;  // Start from root
-        for (int j = i; j < segment_len && current_index != -1; j++) {
-            unsigned char ch = shared_text[j];
-            if ((flat_trie[current_index].bitmap[ch / 32] & (1 << (ch % 32))) == 0) {
+    int position = local_tid;
+    while (position < text_len) {
+        FlatTrieNode* node = &d_trie[0];  // Start at the root
+        int offset = 0;
+        while (node && position + offset < text_len) {
+            char ch = shared_text[position + offset];
+            if (!(node->bitmap[(unsigned char)ch / 32] & (1 << ((unsigned char)ch % 32)))) {
                 break;  // Character not in trie
             }
-            current_index = flat_trie[current_index].offset;  // Move to child
-            if (flat_trie[current_index].is_final) {
-                atomicAdd(&results[start + j], 1);  // Found a pattern ending at j
+            node = &d_trie[node->children[(unsigned char)ch]];
+            offset++;
+            if (node && node->is_end_of_word) {
+                atomicAdd(&d_results[position], 1);
             }
         }
+        position += blockDim.x;
     }
 }
 
-void optimized_gpu_search(node_t* trie, char* text, int text_len) {
-    // Flatten the trie
-    node_count = 0;
-    flatten_trie(trie);
-
-    // Allocate memory on the GPU
-    node_t* d_trie;
+void optimized_gpu_search(FlatTrieNode* flat_trie, int trie_size, const char* text) {
+    FlatTrieNode* d_trie;
     char* d_text;
+    int text_len = strlen(text);
     int* d_results;
-    cudaMalloc(&d_trie, node_count * sizeof(node_t));
-    cudaMalloc(&d_text, text_len * sizeof(char));
+
+    // Allocate memory on GPU
+    cudaMalloc(&d_trie, trie_size * sizeof(FlatTrieNode));
+    cudaMalloc(&d_text, text_len + 1);
     cudaMalloc(&d_results, text_len * sizeof(int));
 
-    // Copy data to the GPU
-    cudaMemcpy(d_trie, flat_trie, node_count * sizeof(node_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_text, text, text_len * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemset(d_results, 0, text_len * sizeof(int));
+    // Copy data to GPU memory
+    cudaMemcpy(d_trie, flat_trie, trie_size * sizeof(FlatTrieNode), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_text, text, text_len + 1, cudaMemcpyHostToDevice);
 
-    // Determine grid and block sizes
-    int segment_len = 4;  // Length of text segment for each thread
-    int threads_per_block = 256;
-    int blocks = (text_len + segment_len - 1) / segment_len;
+    // Launch CUDA kernel
+    int numThreadsPerBlock = 256;
+    int numBlocks = (text_len + numThreadsPerBlock - 1) / numThreadsPerBlock;
+    search_kernel<<<numBlocks, blockSize>>>(d_flat_trie, d_text, d_results);
 
-    // Launch the optimized kernel
-    optimized_gpu_search_kernel<<<blocks, threads_per_block>>>(d_trie, d_text, text_len, segment_len, d_results);
-
-    // Copy results back to the host and process them
+    // Copy results back to CPU
     int results[text_len];
     cudaMemcpy(results, d_results, text_len * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Process the results array to identify matches and their positions
     for (int i = 0; i < text_len; i++) {
         if (results[i] > 0) {
-            printf("Pattern found ending at position %d\n", i);
+            printf("Pattern found at position %d\n", i);
         }
     }
 
-    // Cleanup
+    // Cleanup GPU memory
     cudaFree(d_trie);
     cudaFree(d_text);
     cudaFree(d_results);
-}
-
-// CPU search function
-void cpu_search(node_t* root, char* text, int text_len) {
-    for (int i = 0; i < text_len; i++) {
-        node_t* current = root;
-        for (int j = i; j < text_len && current; j++) {
-            unsigned char ch = text[j];
-            if ((current->bitmap[ch / 32] & (1 << (ch % 32))) == 0) {
-                break;  // Character not in trie
-            }
-            current = current->children[ch];
-            if (current && current->is_final) {
-                printf("Pattern found ending at position %d\n", j);
-            }
-        }
-    }
-}
-
-void free_trie(node_t* root) {
-    if (!root) return;
-    for (int i = 0; i < 256; i++) {
-        if (root->children[i]) {
-            free_trie(root->children[i]);
-        }
-    }
-    free(root);
 }
 
 
@@ -156,6 +217,21 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    TrieNode* root = create_node();
+
+    // Load patterns from argv[2] and insert into trie
+    FILE* patterns_file = fopen(argv[2], "r");
+    char pattern[256];
+    while (fgets(pattern, sizeof(pattern), patterns_file)) {
+        pattern[strcspn(pattern, "\n")] = 0;  // Remove newline character
+        insert(root, pattern);
+    }
+    fclose(patterns_file);
+
+    compress_trie(root);
+    compress_suffixes(root, root);
+
+
     // Load text from argv[1]
     FILE* text_file = fopen(argv[1], "r");
     fseek(text_file, 0, SEEK_END);
@@ -163,33 +239,20 @@ int main(int argc, char* argv[]) {
     fseek(text_file, 0, SEEK_SET);
     char* text = (char*)malloc(text_len + 1);
     fread(text, 1, text_len, text_file);
-    text[text_len] = '\0';  // Null-terminate the string
+    text[text_len] = '\0';
     fclose(text_file);
 
-    // Build the trie using the patterns from argv[2]
-    node_t* root = create_node();
-    FILE* patterns_file = fopen(argv[2], "r");
-    char pattern[256];  // Assuming max pattern length is 255
-    while (fgets(pattern, sizeof(pattern), patterns_file)) {
-        pattern[strcspn(pattern, "\n")] = 0;  // Remove newline character
-        insert_pattern(root, pattern);
-    }
-    fclose(patterns_file);
-
-    // Decide the search mode based on argv[3]
     if (strcmp(argv[3], "cpu") == 0) {
-        cpu_search(root, text, text_len);
+        cpu_search(root, text);
     } else if (strcmp(argv[3], "gpu") == 0) {
-        optimized_gpu_search(root, text, text_len);
+        optimized_gpu_search(root, text);
     } else {
         printf("Invalid search mode! Choose 'cpu' or 'gpu'.\n");
         return -1;
     }
 
-    // Cleanup
     free(text);
     free_trie(root);
-
 
     return 0;
 }
